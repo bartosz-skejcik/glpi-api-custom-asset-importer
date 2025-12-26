@@ -55,7 +55,9 @@ class GLPIAPIClient:
     """GLPI API Client using OAuth2 authentication"""
 
     def __init__(self, base_url: str, client_id: str, client_secret: str,
-                 username: str, password: str, verify_ssl: bool = True):
+                 username: str, password: str, verify_ssl: bool = True,
+                 entity_id: Optional[int] = None, profile_id: Optional[int] = None,
+                 timeout: int = 30):
         """
         Initialize the GLPI API client
 
@@ -66,14 +68,20 @@ class GLPIAPIClient:
             username: GLPI username
             password: GLPI password
             verify_ssl: Whether to verify SSL certificates
+            entity_id: Optional entity ID for multi-entity setups
+            profile_id: Optional profile ID
+            timeout: Request timeout in seconds (default: 30)
         """
         self.base_url = base_url.rstrip('/')
-        self.api_url = f"{self.base_url}/api.php/v2.1"
+        self.api_url = f"{self.base_url}/api.php"
         self.client_id = client_id
         self.client_secret = client_secret
         self.username = username
         self.password = password
         self.verify_ssl = verify_ssl
+        self.entity_id = entity_id
+        self.profile_id = profile_id
+        self.timeout = timeout
         self.access_token: Optional[str] = None
         self.token_expires_at: Optional[datetime] = None
 
@@ -100,7 +108,7 @@ class GLPIAPIClient:
                 "scope": "api"
             }
 
-            response = requests.post(token_url, data=data, verify=self.verify_ssl)
+            response = requests.post(token_url, data=data, verify=self.verify_ssl, timeout=self.timeout)
             response.raise_for_status()
 
             token_data = response.json()
@@ -111,6 +119,10 @@ class GLPIAPIClient:
                 print_error("Failed to get access token from response")
                 return False
 
+            # Store token expiry time (with 60 second buffer)
+            from datetime import timedelta
+            self.token_expires_at = datetime.now() + timedelta(seconds=expires_in - 60)
+
             print_success("Authentication successful!")
             return True
 
@@ -120,52 +132,109 @@ class GLPIAPIClient:
                 print_error(f"Response: {e.response.text}")
             return False
 
-    def _get_headers(self) -> Dict[str, str]:
-        """Get headers for API requests"""
-        return {
+    def _ensure_authenticated(self) -> bool:
+        """Ensure we have a valid token, re-authenticating if necessary"""
+        if not self.access_token or not self.token_expires_at:
+            return self.authenticate()
+
+        if datetime.now() >= self.token_expires_at:
+            print_info("Token expired, re-authenticating...")
+            return self.authenticate()
+
+        return True
+
+    def _get_headers(self, include_content_type: bool = False) -> Dict[str, str]:
+        """Get headers for API requests
+
+        Args:
+            include_content_type: Whether to include Content-Type header (only for POST/PATCH)
+        """
+        headers = {
             "Authorization": f"Bearer {self.access_token}",
-            "Content-Type": "application/json",
             "Accept": "application/json"
         }
 
+        if include_content_type:
+            headers["Content-Type"] = "application/json"
+
+        # Add optional entity and profile headers
+        if self.entity_id is not None:
+            headers["GLPI-Entity"] = str(self.entity_id)
+        if self.profile_id is not None:
+            headers["GLPI-Profile"] = str(self.profile_id)
+
+        return headers
+
+    def _is_custom_asset(self, item_type: str) -> bool:
+        """Check if an asset type is a custom asset"""
+        try:
+            if not self._ensure_authenticated():
+                return False
+
+            # Get custom assets list
+            url = f"{self.api_url}/Assets/Custom/"
+            response = requests.get(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
+            if response.status_code == 200:
+                custom_assets = response.json()
+                for asset in custom_assets:
+                    if asset.get('itemtype') == item_type or asset.get('name') == item_type:
+                        return True
+            return False
+        except:
+            return False
+
     def get_asset_definitions(self) -> List[Dict[str, Any]]:
         """
-        Get all asset definitions (including custom ones)
+        Get all asset types available in GLPI (both standard and custom)
 
         Returns:
-            List of asset definitions
+            List of asset types with itemtype, name, and href
         """
         try:
-            url = f"{self.api_url}/Assets/AssetDefinition"
-            response = requests.get(url, headers=self._get_headers(), verify=self.verify_ssl)
+            if not self._ensure_authenticated():
+                return []
+
+            all_assets = []
+
+            # Get standard assets
+            url = f"{self.api_url}/Assets/"
+            response = requests.get(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
             response.raise_for_status()
-            return response.json()
+            all_assets.extend(response.json())
+
+            # Get custom assets
+            url = f"{self.api_url}/Assets/Custom/"
+            response = requests.get(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
+            response.raise_for_status()
+            all_assets.extend(response.json())
+
+            return all_assets
         except requests.exceptions.RequestException as e:
-            print_error(f"Failed to get asset definitions: {str(e)}")
+            print_error(f"Failed to get asset types: {str(e)}")
             return []
 
     def get_asset_definition(self, asset_type: str) -> Optional[Dict[str, Any]]:
         """
-        Get a specific asset definition by system name
+        Get a specific asset type by itemtype or name
 
         Args:
-            asset_type: System name of the asset type
+            asset_type: Itemtype or name of the asset type (e.g., Computer, Monitor)
 
         Returns:
-            Asset definition or None if not found
+            Asset type info or None if not found
         """
         try:
-            # Try to get asset definitions
+            # Get all asset types
             definitions = self.get_asset_definitions()
             for definition in definitions:
-                if definition.get('system_name') == asset_type or definition.get('name') == asset_type:
+                if definition.get('itemtype') == asset_type or definition.get('name') == asset_type:
                     return definition
 
-            print_warning(f"Asset definition '{asset_type}' not found")
+            print_warning(f"Asset type '{asset_type}' not found")
             return None
 
         except Exception as e:
-            print_error(f"Failed to get asset definition: {str(e)}")
+            print_error(f"Failed to get asset type: {str(e)}")
             return None
 
     def get_schema(self, item_type: str) -> Optional[Dict[str, Any]]:
@@ -173,22 +242,26 @@ class GLPIAPIClient:
         Get the schema for an item type
 
         Args:
-            item_type: Type of item (e.g., Computer, Monitor, AssetDefinition)
+            item_type: Type of item (e.g., Computer, Monitor)
 
         Returns:
             Schema definition or None if not found
         """
         try:
-            # Try common endpoints
+            if not self._ensure_authenticated():
+                return None
+
+            # Try common endpoints (including custom assets)
             endpoints = [
                 f"{self.api_url}/Assets/{item_type}",
+                f"{self.api_url}/Assets/Custom/{item_type}",
                 f"{self.api_url}/{item_type}"
             ]
 
             for url in endpoints:
                 try:
                     # Use OPTIONS method to get schema
-                    response = requests.options(url, headers=self._get_headers(), verify=self.verify_ssl)
+                    response = requests.options(url, headers=self._get_headers(), verify=self.verify_ssl, timeout=self.timeout)
                     if response.status_code == 200:
                         return response.json()
                 except:
@@ -212,15 +285,22 @@ class GLPIAPIClient:
             Created item data or None if failed
         """
         try:
-            # Determine the correct endpoint
-            if item_type.startswith('Asset_'):
-                # Custom asset
-                url = f"{self.api_url}/Assets/{item_type}"
-            else:
-                # Standard item type
-                url = f"{self.api_url}/{item_type}"
+            if not self._ensure_authenticated():
+                return None
 
-            response = requests.post(url=url, headers=self._get_headers(), style='width:100%; max-width:100%' json=data, verify=self.verify_ssl)
+            # Determine endpoint based on asset type
+            if self._is_custom_asset(item_type):
+                url = f"{self.api_url}/Assets/Custom/{item_type}"
+            else:
+                url = f"{self.api_url}/Assets/{item_type}"
+
+            response = requests.post(
+                url=url,
+                headers=self._get_headers(include_content_type=True),
+                json=data,
+                verify=self.verify_ssl,
+                timeout=self.timeout,
+            )
             response.raise_for_status()
 
             return response.json()
@@ -237,35 +317,61 @@ class GLPIAPIClient:
 
     def search_item(self, item_type: str, field: str, value: str) -> List[Dict[str, Any]]:
         """
-        Search for items in GLPI
+        Search for items in GLPI with pagination support
 
         Args:
             item_type: Type of item to search
             field: Field to search on
-            value: Value to search for
+            value: Value to search for (exact match)
 
         Returns:
             List of matching items
         """
         try:
-            if item_type.startswith('Asset_'):
-                url = f"{self.api_url}/Assets/{item_type}"
+            if not self._ensure_authenticated():
+                return []
+
+            # Determine endpoint based on asset type
+            if self._is_custom_asset(item_type):
+                url = f"{self.api_url}/Assets/Custom/{item_type}"
             else:
-                url = f"{self.api_url}/{item_type}"
+                url = f"{self.api_url}/Assets/{item_type}"
 
-            # Use RSQL filtering
-            filter_query = f"{field}=ilike={value}"
-            params = {"filter": filter_query}
+            # Use exact match RSQL filtering and pagination
+            filter_query = f"{field}=={value}"
+            all_results = []
+            start = 0
+            limit = 100
 
-            response = requests.get(
-                url,
-                headers=self._get_headers(),
-                params=params,
-                verify=self.verify_ssl
-            )
-            response.raise_for_status()
+            while True:
+                params = {
+                    "filter": filter_query,
+                    "start": start,
+                    "limit": limit
+                }
 
-            return response.json()
+                response = requests.get(
+                    url,
+                    headers=self._get_headers(),
+                    params=params,
+                    verify=self.verify_ssl,
+                    timeout=self.timeout
+                )
+                response.raise_for_status()
+
+                results = response.json()
+                if not results:
+                    break
+
+                all_results.extend(results)
+
+                # If we got fewer results than the limit, we've reached the end
+                if len(results) < limit:
+                    break
+
+                start += limit
+
+            return all_results
 
         except requests.exceptions.RequestException as e:
             print_error(f"Failed to search {item_type}: {str(e)}")
@@ -429,22 +535,21 @@ class AssetImporter:
         """List all available asset types"""
         print_header("Available Asset Types")
 
-        print_info("Fetching asset definitions from GLPI...")
-        definitions = self.client.get_asset_definitions()
+        print_info("Fetching asset types from GLPI...")
+        asset_types = self.client.get_asset_definitions()
 
-        if definitions:
-            print_success(f"Found {len(definitions)} asset definitions:\n")
+        if asset_types:
+            print_success(f"Found {len(asset_types)} asset types:\n")
 
-            print(f"{'System Name':<30} {'Display Name':<30} {'ID':<10}")
-            print("-" * 70)
+            print(f"{'Item Type':<30} {'Display Name':<30}")
+            print("-" * 60)
 
-            for definition in definitions:
-                system_name = definition.get('system_name', 'N/A')
-                name = definition.get('name', 'N/A')
-                asset_id = definition.get('id', 'N/A')
-                print(f"{system_name:<30} {name:<30} {asset_id:<10}")
+            for asset_type in asset_types:
+                itemtype = asset_type.get('itemtype', 'N/A')
+                name = asset_type.get('name', 'N/A')
+                print(f"{itemtype:<30} {name:<30}")
         else:
-            print_warning("No asset definitions found")
+            print_warning("No asset types found")
             print_info("\nCommon built-in types you can try:")
             common_types = [
                 "Computer", "Monitor", "NetworkEquipment",
@@ -483,7 +588,10 @@ def create_default_config(config_file: str = "config.json"):
         "client_secret": "your_client_secret",
         "username": "your_username",
         "password": "your_password",
-        "verify_ssl": True
+        "verify_ssl": True,
+        "entity_id": None,
+        "profile_id": None,
+        "timeout": 30
     }
 
     save_config(default_config, config_file)
@@ -564,7 +672,10 @@ Examples:
             client_secret=config['client_secret'],
             username=config['username'],
             password=config['password'],
-            verify_ssl=config.get('verify_ssl', True)
+            verify_ssl=config.get('verify_ssl', True),
+            entity_id=config.get('entity_id'),
+            profile_id=config.get('profile_id'),
+            timeout=config.get('timeout', 30)
         )
 
         # Authenticate
