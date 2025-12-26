@@ -105,7 +105,7 @@ class GLPIAPIClient:
                 "client_secret": self.client_secret,
                 "username": self.username,
                 "password": self.password,
-                "scope": "api"
+                "scope": "email user api inventory status graphql"
             }
 
             response = requests.post(token_url, data=data, verify=self.verify_ssl, timeout=self.timeout)
@@ -273,6 +273,47 @@ class GLPIAPIClient:
             print_error(f"Failed to get schema for {item_type}: {str(e)}")
             return None
 
+    def get_asset_fields(self, item_type: str) -> Optional[Dict[str, Any]]:
+        """
+        Get all available fields/properties for an asset type from OpenAPI schema
+
+        Args:
+            item_type: Type of item (e.g., Computer, Monitor, Laptop)
+
+        Returns:
+            Dictionary of field properties or None if not found
+        """
+        try:
+            # Get the OpenAPI documentation
+            doc_url = f"{self.base_url}/api.php/doc.json"
+            response = requests.get(doc_url, verify=self.verify_ssl, timeout=self.timeout)
+            response.raise_for_status()
+
+            doc = response.json()
+
+            # Look for the schema in components.schemas
+            if 'components' in doc and 'schemas' in doc['components']:
+                schemas = doc['components']['schemas']
+
+                # Try direct match first
+                if item_type in schemas:
+                    schema = schemas[item_type]
+                    if 'properties' in schema:
+                        return schema['properties']
+
+                # For custom assets, try with CustomAsset_ prefix
+                custom_name = f"CustomAsset_{item_type}"
+                if custom_name in schemas:
+                    schema = schemas[custom_name]
+                    if 'properties' in schema:
+                        return schema['properties']
+
+            return None
+
+        except Exception as e:
+            print_error(f"Failed to get fields for {item_type}: {str(e)}")
+            return None
+
     def create_item(self, item_type: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Create an item in GLPI
@@ -377,12 +418,154 @@ class GLPIAPIClient:
             print_error(f"Failed to search {item_type}: {str(e)}")
             return []
 
+    def resolve_dropdown_id(self, dropdown_type: str, name: str, asset_type: Optional[str] = None) -> Optional[int]:
+        """
+        Resolve a dropdown item name to its ID
+
+        Args:
+            dropdown_type: Type of dropdown (e.g., Location, Manufacturer, State, User, Group)
+            name: Name to search for (for locations, can be hierarchical like "Biuro > 6 Piętro > IT")
+            asset_type: Optional asset type for context-aware resolution (e.g., "Laptop" for LaptopModel)
+
+        Returns:
+            The ID of the item or None if not found
+        """
+        try:
+            if not self._ensure_authenticated():
+                return None
+
+            # Determine the correct endpoint and method
+            # Special handling for User - search by username field
+            if dropdown_type == 'User':
+                # Users: use /Administration/User endpoint with username filter
+                url = f"{self.api_url}/Administration/User"
+                filter_query = f"username=={name.strip()}"
+                params = {"filter": filter_query, "limit": 1}
+
+                response = requests.get(
+                    url,
+                    headers=self._get_headers(),
+                    params=params,
+                    verify=self.verify_ssl,
+                    timeout=self.timeout
+                )
+                response.raise_for_status()
+
+                users = response.json()
+                if users and len(users) > 0:
+                    return users[0].get('id')
+                return None
+
+            # For custom asset models, check if it's a custom asset type
+            elif dropdown_type.endswith('Model') and asset_type and self._is_custom_asset(asset_type):
+                # Custom asset model - use /Assets/Custom/{AssetType}Model
+                url = f"{self.api_url}/Assets/Custom/{asset_type}Model"
+            else:
+                # Standard dropdown
+                url = f"{self.api_url}/Dropdowns/{dropdown_type}"
+
+            # For hierarchical names (locations), search by completename
+            # Otherwise search by name
+            if '>' in name:
+                # Hierarchical path - search by completename
+                filter_query = f"completename=={name.strip()}"
+            else:
+                # Simple name
+                filter_query = f"name=={name.strip()}"
+
+            params = {"filter": filter_query, "limit": 1}
+
+            response = requests.get(
+                url,
+                headers=self._get_headers(),
+                params=params,
+                verify=self.verify_ssl,
+                timeout=self.timeout
+            )
+            response.raise_for_status()
+
+            results = response.json()
+            if results and len(results) > 0:
+                return results[0].get('id')
+
+            return None
+
+        except requests.exceptions.RequestException as e:
+            print_warning(f"Failed to resolve {dropdown_type} '{name}': {str(e)}")
+            return None
+
 
 class AssetImporter:
     """Main asset importer class"""
 
     def __init__(self, client: GLPIAPIClient):
         self.client = client
+        # Mapping of field suffixes to dropdown types
+        self.dropdown_mappings = {
+            'locations_id': 'Location',
+            'manufacturers_id': 'Manufacturer',
+            'models_id': 'Model',
+            'states_id': 'State',
+            'users_id': 'User',  # Resolved by username/login via /Administration/User/username/{username}
+            'groups_id': 'Group',
+            'types_id': 'Type',
+            'computermodels_id': 'ComputerModel',
+            'computertypes_id': 'ComputerType',
+            'networks_id': 'Network',
+            'autoupdatesystems_id': 'AutoUpdateSystem',
+        }
+
+    def resolve_field_value(self, field_name: str, value: str, asset_type: str) -> Any:
+        """
+        Resolve a field value - convert names to IDs for dropdown fields
+
+        Args:
+            field_name: Name of the field
+            value: Value to resolve (might be a name or already an ID)
+            asset_type: The asset type being imported
+
+        Returns:
+            Resolved value (ID for dropdowns, original value otherwise)
+        """
+        # If it's already a number, return as is
+        if isinstance(value, int):
+            return value
+
+        # Try to parse as integer
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            pass
+
+        # Check if this is a known dropdown field
+        dropdown_type = None
+
+        # For models_id on custom assets, use {AssetType}Model
+        if field_name == 'models_id' and asset_type:
+            dropdown_type = 'Model'  # Will be resolved with asset_type context
+        # Direct mapping
+        elif field_name in self.dropdown_mappings:
+            dropdown_type = self.dropdown_mappings[field_name]
+        # Check for custom asset model/type fields
+        elif field_name.endswith('models_id'):
+            # Extract asset type and try to find model dropdown
+            base_type = field_name.replace('models_id', '').strip('_')
+            if base_type:
+                dropdown_type = f"{base_type.title()}Model"
+        elif field_name.endswith('types_id'):
+            base_type = field_name.replace('types_id', '').strip('_')
+            if base_type:
+                dropdown_type = f"{base_type.title()}Type"
+
+        # Try to resolve the name to an ID
+        if dropdown_type:
+            resolved_id = self.client.resolve_dropdown_id(dropdown_type, str(value), asset_type)
+            if resolved_id is not None:
+                return resolved_id
+            else:
+                print_warning(f"Could not resolve {field_name} '{value}' to an ID. Using original value.")
+
+        return value
 
     def generate_template(self, asset_type: str, output_file: str = "template.csv"):
         """
@@ -408,16 +591,23 @@ class AssetImporter:
             "groups_id"
         ]
 
-        # Try to get schema from API
+        # Try to get custom fields from API
+        api_fields = self.client.get_asset_fields(asset_type)
+        custom_field_names = []
+        if api_fields and 'custom_fields' in api_fields:
+            custom_fields_info = api_fields['custom_fields']
+            if 'properties' in custom_fields_info:
+                custom_field_names = list(custom_fields_info['properties'].keys())
+
+        # Combine standard fields with custom fields
+        fields = base_fields + custom_field_names
+
+        # Try to get schema from API (currently not used to override fields)
         schema = self.client.get_schema(asset_type)
         if schema:
             print_info(f"Retrieved schema from API for {asset_type}")
-            # Extract fields from schema if available
-            # This would need to be adjusted based on actual GLPI API response
-            fields = base_fields
         else:
             print_info(f"Using default fields for {asset_type}")
-            fields = base_fields
 
         # Create template file
         try:
@@ -435,7 +625,10 @@ class AssetImporter:
             print_info(f"Fields included: {', '.join(fields)}")
             print_info(f"\nPlease fill in the template with your asset data.")
             print_info(f"You can add multiple rows for multiple assets.")
-            print_info(f"For ID fields (*_id), use the numeric ID from GLPI or leave empty.")
+            print_info(f"For *_id fields, you can use either:")
+            print_info(f"  - Numeric IDs from GLPI")
+            print_info(f"  - Names (will be auto-resolved, e.g., 'HP' for manufacturer)")
+            print_info(f"  - Hierarchical paths for locations (e.g., 'Biuro > 6 Piętro > IT')")
 
         except Exception as e:
             print_error(f"Failed to create template: {str(e)}")
@@ -485,14 +678,43 @@ class AssetImporter:
                     item_data = {}
                     for key, value in row.items():
                         if value and not value.startswith('<') and value.strip():
-                            # Convert ID fields to integers
-                            if key.endswith('_id'):
-                                try:
-                                    item_data[key] = int(value)
-                                except ValueError:
-                                    print_warning(f"Invalid ID value for {key}: {value}")
-                            else:
-                                item_data[key] = value.strip()
+                            # Resolve field values (convert names to IDs for dropdowns)
+                            resolved_value = self.resolve_field_value(key, value.strip(), asset_type)
+                            item_data[key] = resolved_value
+
+                    # Get custom field names for this asset type
+                    api_fields = self.client.get_asset_fields(asset_type)
+                    custom_field_names = set()
+                    if api_fields and 'custom_fields' in api_fields:
+                        custom_fields_info = api_fields['custom_fields']
+                        if 'properties' in custom_fields_info:
+                            custom_field_names = set(custom_fields_info['properties'].keys())
+
+                    # Transform *_id fields to object format for GLPI API
+                    # Also extract custom fields to nest under custom_fields
+                    # e.g., locations_id: 3 -> location: {id: 3}
+                    transformed_data = {}
+                    extracted_custom_fields = {}
+
+                    for key, value in item_data.items():
+                        # Check if this is a custom field
+                        if key in custom_field_names:
+                            extracted_custom_fields[key] = value
+                        elif key.endswith('_id') and isinstance(value, int):
+                            # Convert field_name_id to field_name with object
+                            field_name = key[:-3]  # Remove '_id' suffix
+                            # Handle plural to singular (locations -> location, etc.)
+                            if field_name.endswith('s'):
+                                field_name = field_name[:-1]
+                            transformed_data[field_name] = {'id': value}
+                        else:
+                            transformed_data[key] = value
+
+                    # Add custom fields as nested object if any exist
+                    if extracted_custom_fields:
+                        transformed_data['custom_fields'] = extracted_custom_fields
+
+                    item_data = transformed_data
 
                     if not item_data.get('name'):
                         print_warning(f"[{i}/{stats['total']}] Skipping row without name")
@@ -558,6 +780,67 @@ class AssetImporter:
             for asset_type in common_types:
                 print(f"  - {asset_type}")
 
+    def show_fields(self, asset_type: str):
+        """Show all available fields for a specific asset type"""
+        print_header(f"Fields for {asset_type}")
+
+        print_info(f"Fetching field information for {asset_type}...")
+        fields = self.client.get_asset_fields(asset_type)
+
+        if fields:
+            print_success(f"Found {len(fields)} standard fields:\n")
+
+            # Separate custom fields from standard fields
+            custom_fields_info = fields.pop('custom_fields', None)
+
+            # Display standard fields with their types and descriptions
+            print(f"{'Field Name':<30} {'Type':<15} {'Description':<50}")
+            print("-" * 95)
+
+            for field_name, field_info in sorted(fields.items()):
+                field_type = field_info.get('type', 'unknown')
+                description = field_info.get('description', '')
+
+                # Handle object types (show nested reference if available)
+                if field_type == 'object' and '$ref' in field_info:
+                    ref = field_info['$ref'].split('/')[-1]
+                    field_type = f"object ({ref})"
+                elif field_type == 'array' and 'items' in field_info:
+                    if '$ref' in field_info['items']:
+                        ref = field_info['items']['$ref'].split('/')[-1]
+                        field_type = f"array of {ref}"
+                    else:
+                        item_type = field_info['items'].get('type', 'unknown')
+                        field_type = f"array of {item_type}"
+
+                # Truncate long descriptions
+                if len(description) > 50:
+                    description = description[:47] + "..."
+
+                # Show if field is read-only
+                if field_info.get('readOnly'):
+                    field_name = f"{field_name} (read-only)"
+
+                print(f"{field_name:<30} {field_type:<15} {description:<50}")
+
+            # Display custom fields if they exist
+            if custom_fields_info and 'properties' in custom_fields_info:
+                custom_fields = custom_fields_info['properties']
+                print(f"\n{Colors.OKBLUE}Custom Fields ({len(custom_fields)}):{Colors.ENDC}")
+                print("-" * 95)
+                for cf_name, cf_info in sorted(custom_fields.items()):
+                    cf_type = cf_info.get('type', 'unknown')
+                    cf_desc = cf_info.get('description', '')
+                    if len(cf_desc) > 50:
+                        cf_desc = cf_desc[:47] + "..."
+                    print(f"{cf_name:<30} {cf_type:<15} {cf_desc:<50}")
+
+            print_info("\nUse these field names when creating CSV files for import.")
+            print_info("Fields marked as 'read-only' are set by GLPI and cannot be imported.")
+        else:
+            print_warning(f"Could not retrieve field information for {asset_type}")
+            print_info("This may happen if the asset type is not found in the API documentation.")
+
 
 def load_config(config_file: str = "config.json") -> Optional[Dict[str, Any]]:
     """Load configuration from JSON file"""
@@ -611,6 +894,10 @@ Examples:
   # List available asset types
   python glpi_asset_importer.py --list-types
 
+  # Show all fields for an asset type
+  python glpi_asset_importer.py --show-fields Computer
+  python glpi_asset_importer.py --show-fields Laptop
+
   # Generate a template for Computer assets
   python glpi_asset_importer.py --generate-template Computer
 
@@ -628,6 +915,8 @@ Examples:
                        help='Create a default configuration file')
     parser.add_argument('--list-types', action='store_true',
                        help='List all available asset types')
+    parser.add_argument('--show-fields', metavar='ASSET_TYPE',
+                       help='Show all available fields for a specific asset type')
     parser.add_argument('--generate-template', metavar='ASSET_TYPE',
                        help='Generate a CSV template for the specified asset type')
     parser.add_argument('--import', dest='import_type', metavar='ASSET_TYPE',
@@ -688,6 +977,9 @@ Examples:
         # Handle commands
         if args.list_types:
             importer.list_asset_types()
+
+        elif args.show_fields:
+            importer.show_fields(args.show_fields)
 
         elif args.generate_template:
             importer.generate_template(args.generate_template, args.output)
