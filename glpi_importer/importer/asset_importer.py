@@ -80,11 +80,13 @@ class AssetImporter:
 
         # Try to resolve the name to an ID
         if dropdown_type:
-            resolved_id = self.client.resolve_dropdown_id(dropdown_type, str(value), asset_type)
+            resolved_id = self.client.resolve_dropdown_id(
+                dropdown_type, str(value), asset_type)
             if resolved_id is not None:
                 return resolved_id
             else:
-                print_warning(f"Could not resolve {field_name} '{value}' to an ID. Using original value.")
+                print_warning(
+                    f"Could not resolve {field_name} '{value}' to an ID. Using original value.")
 
         return value
 
@@ -118,7 +120,13 @@ class AssetImporter:
         if api_fields and 'custom_fields' in api_fields:
             custom_fields_info = api_fields['custom_fields']
             if 'properties' in custom_fields_info:
-                custom_field_names = list(custom_fields_info['properties'].keys())
+                custom_fields = custom_fields_info['properties']
+                # Handle both dictionary and list formats
+                if isinstance(custom_fields, dict):
+                    custom_field_names = list(custom_fields.keys())
+                elif isinstance(custom_fields, list):
+                    custom_field_names = [
+                        cf.get('name', '') for cf in custom_fields if cf.get('name')]
 
         # Combine standard fields with custom fields
         fields = base_fields + custom_field_names
@@ -148,14 +156,16 @@ class AssetImporter:
             print_info(f"You can add multiple rows for multiple assets.")
             print_info(f"For *_id fields, you can use either:")
             print_info(f"  - Numeric IDs from GLPI")
-            print_info(f"  - Names (will be auto-resolved, e.g., 'HP' for manufacturer)")
-            print_info(f"  - Hierarchical paths for locations (e.g., 'Office > Floor > Room')")
+            print_info(
+                f"  - Names (will be auto-resolved, e.g., 'HP' for manufacturer)")
+            print_info(
+                f"  - Hierarchical paths for locations (e.g., 'Office > Floor > Room')")
 
         except Exception as e:
             print_error(f"Failed to create template: {str(e)}")
 
     def import_from_csv(self, asset_type: str, csv_file: str,
-                       skip_duplicates: bool = True) -> Dict[str, int]:
+                        skip_duplicates: bool = True) -> Dict[str, int]:
         """
         Import assets from CSV file.
 
@@ -191,7 +201,8 @@ class AssetImporter:
                 for i, row in enumerate(rows, 1):
                     # Skip example/template rows
                     if row.get('name', '').startswith('<') or row.get('name', '') == 'Example Asset Name':
-                        print_warning(f"[{i}/{stats['total']}] Skipping template row")
+                        print_warning(
+                            f"[{i}/{stats['total']}] Skipping template row")
                         stats["skipped"] += 1
                         continue
 
@@ -200,7 +211,8 @@ class AssetImporter:
                     for key, value in row.items():
                         if value and not value.startswith('<') and value.strip():
                             # Resolve field values (convert names to IDs for dropdowns)
-                            resolved_value = self.resolve_field_value(key, value.strip(), asset_type)
+                            resolved_value = self.resolve_field_value(
+                                key, value.strip(), asset_type)
                             item_data[key] = resolved_value
 
                     # Get custom field names for this asset type
@@ -209,7 +221,13 @@ class AssetImporter:
                     if api_fields and 'custom_fields' in api_fields:
                         custom_fields_info = api_fields['custom_fields']
                         if 'properties' in custom_fields_info:
-                            custom_field_names = set(custom_fields_info['properties'].keys())
+                            custom_fields = custom_fields_info['properties']
+                            # Handle both dictionary and list formats
+                            if isinstance(custom_fields, dict):
+                                custom_field_names = set(custom_fields.keys())
+                            elif isinstance(custom_fields, list):
+                                custom_field_names = set(
+                                    cf.get('name', '') for cf in custom_fields if cf.get('name'))
 
                     # Transform *_id fields to object format for GLPI API
                     # Also extract custom fields to nest under custom_fields
@@ -237,27 +255,33 @@ class AssetImporter:
                     item_data = transformed_data
 
                     if not item_data.get('name'):
-                        print_warning(f"[{i}/{stats['total']}] Skipping row without name")
+                        print_warning(
+                            f"[{i}/{stats['total']}] Skipping row without name")
                         stats["skipped"] += 1
                         continue
 
                     # Check for duplicates
                     if skip_duplicates and item_data.get('serial'):
-                        existing = self.client.search_item(asset_type, 'serial', item_data['serial'])
+                        existing = self.client.search_item(
+                            asset_type, 'serial', item_data['serial'])
                         if existing:
-                            print_warning(f"[{i}/{stats['total']}] Skipping duplicate: {item_data['name']} (serial: {item_data['serial']})")
+                            print_warning(
+                                f"[{i}/{stats['total']}] Skipping duplicate: {item_data['name']} (serial: {item_data['serial']})")
                             stats["skipped"] += 1
                             continue
 
                     # Create item
-                    print_info(f"[{i}/{stats['total']}] Creating: {item_data['name']}")
+                    print_info(
+                        f"[{i}/{stats['total']}] Creating: {item_data['name']}")
                     result = self.client.create_item(asset_type, item_data)
 
                     if result:
-                        print_success(f"[{i}/{stats['total']}] Successfully created: {item_data['name']}")
+                        print_success(
+                            f"[{i}/{stats['total']}] Successfully created: {item_data['name']}")
                         stats["success"] += 1
                     else:
-                        print_error(f"[{i}/{stats['total']}] Failed to create: {item_data['name']}")
+                        print_error(
+                            f"[{i}/{stats['total']}] Failed to create: {item_data['name']}")
                         stats["failed"] += 1
 
         except Exception as e:
@@ -346,17 +370,35 @@ class AssetImporter:
             # Display custom fields if they exist
             if custom_fields_info and 'properties' in custom_fields_info:
                 custom_fields = custom_fields_info['properties']
-                print(f"\n{Colors.OKBLUE}Custom Fields ({len(custom_fields)}):{Colors.ENDC}")
+                print(
+                    f"\n{Colors.OKBLUE}Custom Fields ({len(custom_fields)}):{Colors.ENDC}")
                 print("-" * 95)
-                for cf_name, cf_info in sorted(custom_fields.items()):
-                    cf_type = cf_info.get('type', 'unknown')
-                    cf_desc = cf_info.get('description', '')
-                    if len(cf_desc) > 50:
-                        cf_desc = cf_desc[:47] + "..."
-                    print(f"{cf_name:<30} {cf_type:<15} {cf_desc:<50}")
 
-            print_info("\nUse these field names when creating CSV files for import.")
-            print_info("Fields marked as 'read-only' are set by GLPI and cannot be imported.")
+                # Handle both dictionary and list formats
+                if isinstance(custom_fields, dict):
+                    for cf_name, cf_info in sorted(custom_fields.items()):
+                        cf_type = cf_info.get('type', 'unknown')
+                        cf_desc = cf_info.get('description', '')
+                        if len(cf_desc) > 50:
+                            cf_desc = cf_desc[:47] + "..."
+                        print(f"{cf_name:<30} {cf_type:<15} {cf_desc:<50}")
+                elif isinstance(custom_fields, list):
+                    for cf_item in custom_fields:
+                        cf_name = cf_item.get('name', 'unknown')
+                        cf_type = cf_item.get('type', 'unknown')
+                        cf_desc = cf_item.get('description', '')
+                        if len(cf_desc) > 50:
+                            cf_desc = cf_desc[:47] + "..."
+                        print(f"{cf_name:<30} {cf_type:<15} {cf_desc:<50}")
+                else:
+                    print_warning("Custom fields format not recognized")
+
+            print_info(
+                "\nUse these field names when creating CSV files for import.")
+            print_info(
+                "Fields marked as 'read-only' are set by GLPI and cannot be imported.")
         else:
-            print_warning(f"Could not retrieve field information for {asset_type}")
-            print_info("This may happen if the asset type is not found in the API documentation.")
+            print_warning(
+                f"Could not retrieve field information for {asset_type}")
+            print_info(
+                "This may happen if the asset type is not found in the API documentation.")
