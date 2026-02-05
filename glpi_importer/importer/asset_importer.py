@@ -13,14 +13,19 @@ from ..utils.console import (
 class AssetImporter:
     """Main asset importer class."""
 
-    def __init__(self, client: GLPIAPIClient):
+    def __init__(self, client: GLPIAPIClient, auto_create_all: bool = False):
         """
         Initialize the asset importer.
 
         Args:
             client: Authenticated GLPI API client
+            auto_create_all: If True, automatically create all missing items without prompting
         """
         self.client = client
+        self.auto_create_all = auto_create_all
+        # Cache for user decisions about creating missing items
+        # Key: (dropdown_type, value), Value: True/False
+        self._create_cache = {}
         # Mapping of field suffixes to dropdown types
         self.dropdown_mappings = {
             'locations_id': 'Location',
@@ -30,6 +35,17 @@ class AssetImporter:
             'users_id': 'User',
             'groups_id': 'Group',
             'types_id': 'Type',
+            # Also map singular forms (from API responses)
+            'location': 'Location',
+            'manufacturer': 'Manufacturer',
+            'model': 'Model',
+            'state': 'State',
+            'user': 'User',
+            'group': 'Group',
+            'type': 'Type',
+            'user_tech': 'User',
+            'group_tech': 'Group',
+            # Other known fields
             'computermodels_id': 'ComputerModel',
             'computertypes_id': 'ComputerType',
             'networks_id': 'Network',
@@ -48,6 +64,10 @@ class AssetImporter:
         Returns:
             Resolved value (ID for dropdowns, original value otherwise)
         """
+        # If field_name is None or empty, return the original value
+        if not field_name:
+            return value
+
         # If it's already a number, return as is
         if isinstance(value, int):
             return value
@@ -85,8 +105,37 @@ class AssetImporter:
             if resolved_id is not None:
                 return resolved_id
             else:
-                print_warning(
-                    f"Could not resolve {field_name} '{value}' to an ID. Using original value.")
+                # Check cache first
+                cache_key = (dropdown_type, str(value))
+
+                if cache_key in self._create_cache:
+                    should_create = self._create_cache[cache_key]
+                elif self.auto_create_all:
+                    # Auto-create without prompting
+                    should_create = True
+                    self._create_cache[cache_key] = should_create
+                else:
+                    # Ask user if they want to create this item
+                    from ..utils.console import Colors
+                    print_warning(f"Could not find {dropdown_type} '{value}'")
+                    response = input(
+                        f"  {Colors.OKBLUE}ℹ{Colors.ENDC} Create new {dropdown_type} '{value}'? (y/n): ").strip().lower()
+                    should_create = response in ['y', 'yes']
+                    # Cache the decision
+                    self._create_cache[cache_key] = should_create
+
+                if should_create:
+                    print_info(f"Creating new {dropdown_type}: {value}")
+                    created_id = self.client.create_dropdown_item(
+                        dropdown_type, str(value), asset_type)
+                    if created_id is not None:
+                        return created_id
+                    else:
+                        print_warning(
+                            f"Could not create {field_name} '{value}'. Using original value.")
+                else:
+                    print_warning(
+                        f"Skipping creation. Using original value for {field_name} '{value}'.")
 
         return value
 
@@ -200,7 +249,14 @@ class AssetImporter:
 
                 for i, row in enumerate(rows, 1):
                     # Skip example/template rows
-                    if row.get('name', '').startswith('<') or row.get('name', '') == 'Example Asset Name':
+                    name_value = row.get('name', '')
+                    # Ensure name_value is a string
+                    if isinstance(name_value, list):
+                        name_value = name_value[0] if name_value else ''
+                    elif not isinstance(name_value, str):
+                        name_value = str(name_value) if name_value else ''
+
+                    if name_value.startswith('<') or name_value == 'Example Asset Name':
                         print_warning(
                             f"[{i}/{stats['total']}] Skipping template row")
                         stats["skipped"] += 1
@@ -209,6 +265,12 @@ class AssetImporter:
                     # Clean up row data
                     item_data = {}
                     for key, value in row.items():
+                        # Ensure value is a string
+                        if isinstance(value, list):
+                            value = value[0] if value else ''
+                        elif not isinstance(value, str):
+                            value = str(value) if value else ''
+
                         if value and not value.startswith('<') and value.strip():
                             # Resolve field values (convert names to IDs for dropdowns)
                             resolved_value = self.resolve_field_value(
@@ -229,28 +291,54 @@ class AssetImporter:
                                 custom_field_names = set(
                                     cf.get('name', '') for cf in custom_fields if cf.get('name'))
 
-                    # Transform *_id fields to object format for GLPI API
+                    print_info(
+                        f"DEBUG: Custom field names from target API: {custom_field_names}")
+                    print_info(
+                        f"DEBUG: Fields in CSV row: {list(item_data.keys())}")
+
+                    # Transform fields to API format
                     # Also extract custom fields to nest under custom_fields
                     transformed_data = {}
                     extracted_custom_fields = {}
 
                     for key, value in item_data.items():
+                        # Skip None or empty keys
+                        if not key:
+                            continue
+
                         # Check if this is a custom field
                         if key in custom_field_names:
+                            print_info(
+                                f"DEBUG: Identified custom field: {key} = {value}")
                             extracted_custom_fields[key] = value
-                        elif key.endswith('_id') and isinstance(value, int):
-                            # Convert field_name_id to field_name with object
-                            field_name = key[:-3]  # Remove '_id' suffix
-                            # Handle plural to singular (locations -> location, etc.)
-                            if field_name.endswith('s'):
+                        # Check if this is a dropdown field (resolved to an ID)
+                        elif isinstance(value, int) and (key in self.dropdown_mappings or key.endswith('_id')):
+                            # This is a resolved dropdown ID - wrap it in an object
+                            # Determine the field name for the API (without _id suffix)
+                            if key.endswith('_id'):
+                                field_name = key[:-3]  # Remove '_id' suffix
+                            else:
+                                field_name = key
+
+                            # Handle plural to singular for some fields
+                            if field_name.endswith('s') and field_name not in ['status', 'os']:
                                 field_name = field_name[:-1]
+
                             transformed_data[field_name] = {'id': value}
                         else:
+                            # Regular field - use as-is
                             transformed_data[key] = value
 
                     # Add custom fields as nested object if any exist
                     if extracted_custom_fields:
                         transformed_data['custom_fields'] = extracted_custom_fields
+                        print_info(
+                            f"DEBUG: Adding custom_fields to payload: {extracted_custom_fields}")
+                    else:
+                        print_info("DEBUG: No custom fields extracted")
+
+                    print_info(
+                        f"DEBUG: Final transformed_data keys: {list(transformed_data.keys())}")
 
                     item_data = transformed_data
 
