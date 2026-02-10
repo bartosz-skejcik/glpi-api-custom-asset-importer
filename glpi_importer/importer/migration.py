@@ -65,11 +65,20 @@ class MigrationManager:
 
             # Determine fields to export
             if fields is None:
-                # Get all available fields from the first asset
-                fields = list(assets[0].keys())
+                # Get all available fields from the first asset (including flattened custom fields)
+                first_asset = assets[0].copy()
+                if 'custom_fields' in first_asset and isinstance(first_asset['custom_fields'], dict):
+                    first_asset.update(first_asset['custom_fields'])
+                fields = list(first_asset.keys())
             else:
-                # Validate that requested fields exist
-                available_fields = set(assets[0].keys())
+                # Validate that requested fields exist (check both regular and custom fields)
+                first_asset = assets[0].copy()
+                available_fields = set(first_asset.keys())
+                # Add custom field names to available fields
+                if 'custom_fields' in first_asset and isinstance(first_asset['custom_fields'], dict):
+                    available_fields.update(
+                        first_asset['custom_fields'].keys())
+
                 requested_fields = set(fields)
                 missing_fields = requested_fields - available_fields
                 if missing_fields:

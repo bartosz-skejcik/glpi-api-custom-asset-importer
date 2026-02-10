@@ -2,7 +2,7 @@
 
 import csv
 import os
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from ..api.client import GLPIAPIClient
 from ..utils.console import (
@@ -52,7 +52,7 @@ class AssetImporter:
             'autoupdatesystems_id': 'AutoUpdateSystem',
         }
 
-    def resolve_field_value(self, field_name: str, value: str, asset_type: str) -> Any:
+    def resolve_field_value(self, field_name: str, value: str, asset_type: str, dropdown_cache: Optional[dict] = None) -> Any:
         """
         Resolve a field value - convert names to IDs for dropdown fields.
 
@@ -60,6 +60,7 @@ class AssetImporter:
             field_name: Name of the field
             value: Value to resolve (might be a name or already an ID)
             asset_type: The asset type being imported
+            dropdown_cache: Cache dict for resolved dropdown IDs {(dropdown_type, value, asset_type): id}
 
         Returns:
             Resolved value (ID for dropdowns, original value otherwise)
@@ -100,20 +101,29 @@ class AssetImporter:
 
         # Try to resolve the name to an ID
         if dropdown_type:
+            cache_key = (dropdown_type, str(value), asset_type)
+
+            # Check cache first - avoid redundant API calls
+            if dropdown_cache is not None and cache_key in dropdown_cache:
+                return dropdown_cache[cache_key]
+
             resolved_id = self.client.resolve_dropdown_id(
                 dropdown_type, str(value), asset_type)
             if resolved_id is not None:
+                # Store in cache for future use
+                if dropdown_cache is not None:
+                    dropdown_cache[cache_key] = resolved_id
                 return resolved_id
             else:
                 # Check cache first
-                cache_key = (dropdown_type, str(value))
+                create_cache_key = (dropdown_type, str(value))
 
-                if cache_key in self._create_cache:
-                    should_create = self._create_cache[cache_key]
+                if create_cache_key in self._create_cache:
+                    should_create = self._create_cache[create_cache_key]
                 elif self.auto_create_all:
                     # Auto-create without prompting
                     should_create = True
-                    self._create_cache[cache_key] = should_create
+                    self._create_cache[create_cache_key] = should_create
                 else:
                     # Ask user if they want to create this item
                     from ..utils.console import Colors
@@ -122,13 +132,16 @@ class AssetImporter:
                         f"  {Colors.OKBLUE}ℹ{Colors.ENDC} Create new {dropdown_type} '{value}'? (y/n): ").strip().lower()
                     should_create = response in ['y', 'yes']
                     # Cache the decision
-                    self._create_cache[cache_key] = should_create
+                    self._create_cache[create_cache_key] = should_create
 
                 if should_create:
                     print_info(f"Creating new {dropdown_type}: {value}")
                     created_id = self.client.create_dropdown_item(
                         dropdown_type, str(value), asset_type)
                     if created_id is not None:
+                        # Store in cache for future use
+                        if dropdown_cache is not None:
+                            dropdown_cache[cache_key] = created_id
                         return created_id
                     else:
                         print_warning(
@@ -240,6 +253,10 @@ class AssetImporter:
             return stats
 
         try:
+            # Cache for resolved dropdown IDs to avoid redundant API calls
+            # Key: (dropdown_type, value_name), Value: resolved_id
+            dropdown_cache = {}
+
             with open(csv_file, 'r', encoding='utf-8') as csvfile:
                 reader = csv.DictReader(csvfile)
                 rows = list(reader)
@@ -274,7 +291,7 @@ class AssetImporter:
                         if value and not value.startswith('<') and value.strip():
                             # Resolve field values (convert names to IDs for dropdowns)
                             resolved_value = self.resolve_field_value(
-                                key, value.strip(), asset_type)
+                                key, value.strip(), asset_type, dropdown_cache)
                             item_data[key] = resolved_value
 
                     # Get custom field names for this asset type
